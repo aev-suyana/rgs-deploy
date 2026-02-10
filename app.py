@@ -402,6 +402,35 @@ def main():
         default=[]
     )
     
+    # Peril Filter
+    peril_options = ["Chuva (CHIRPS)", "Seca (ERA5)"]
+    selected_perils_friendly = st.sidebar.multiselect(
+        "Filtrar por Perigo",
+        options=peril_options,
+        default=[]
+    )
+    # Map back to dataset values
+    peril_map_rev = {"Chuva (CHIRPS)": "chirps", "Seca (ERA5)": "era5"}
+    selected_perils = [peril_map_rev[p] for p in selected_perils_friendly]
+    
+    # Window Filter
+    # Map Windows to Full Names (same as in charts for consistency)
+    window_map_display = {
+        'apr_may': 'April-May (Rainfall)',
+        'sep_oct': 'September-October (Soil Moisture)',
+        'oct_dec': 'October-December (Soil Moisture)',
+        'dec_feb': 'December-February (Rainfall)'
+    }
+    available_windows_friendly = list(window_map_display.values())
+    selected_windows_friendly = st.sidebar.multiselect(
+        "Filtrar por Janelas Climáticas",
+        options=available_windows_friendly,
+        default=[]
+    )
+    # Map back to internal window keys
+    window_map_rev = {v: k for k, v in window_map_display.items()}
+    selected_windows = [window_map_rev[w] for w in selected_windows_friendly]
+    
     # Apply Filters
     df_filtered = df[
         (df['year'] >= selected_years[0]) & 
@@ -413,6 +442,12 @@ def main():
         
     if selected_clusters:
         df_filtered = df_filtered[df_filtered['cluster'].isin(selected_clusters)]
+        
+    if selected_perils:
+        df_filtered = df_filtered[df_filtered['dataset'].isin(selected_perils)]
+        
+    if selected_windows:
+        df_filtered = df_filtered[df_filtered['window'].isin(selected_windows)]
         
     # Recalculate metrics based on filtered data
     if df_filtered.empty:
@@ -707,7 +742,9 @@ def main():
     if selected_munis:
         sel_desc_parts.append(f"Municípios: {', '.join(selected_munis)}")
     if selected_clusters:
-        sel_desc_parts.append(f"Clusters: {sorted(selected_clusters)}")
+        # Cast to standard int to avoid np.int64 display in banner
+        clean_clusters = [int(c) for c in selected_clusters]
+        sel_desc_parts.append(f"Clusters: {sorted(clean_clusters)}")
     
     selection_description = " | ".join(sel_desc_parts) if sel_desc_parts else "Seleção Personalizada/Manual"
     
