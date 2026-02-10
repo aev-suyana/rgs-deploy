@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import altair as alt
@@ -7,12 +6,30 @@ from streamlit_folium import st_folium
 import os
 import json
 import warnings
+import io
+import geopandas as gpd
+from shapely.geometry import Point, shape
+import numpy as np
+from folium.plugins import Draw
+from PIL import Image
 
 # Suppress FutureWarning for 'observed' parameter in groupby
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
 # Page Configuration
 st.set_page_config(layout="wide", page_title="Pixel Loss Dashboard")
+
+# Custom CSS for Aesthetics
+st.markdown("""
+    <style>
+        [data-testid="stSidebar"] {
+            background-color: white !important;
+        }
+        [data-testid="stSidebarNav"] {
+            background-color: white !important;
+        }
+    </style>
+""", unsafe_allow_html=True)
 
 # Constants
 # Use absolute path relative to this script
@@ -24,15 +41,6 @@ MAPPING_PATH = os.path.join(BASE_DIR, "data", "pixel_municipality_assignment_v3.
 CLUSTERS_PATH = os.path.join(BASE_DIR, "data", "municipality_clusters_final.csv")
 ERA5_PATH = os.path.join(BASE_DIR, "data", "valid_pixels_era5.csv")
 WINDOWS = ['apr_may', 'sep_oct', 'oct_dec', 'dec_feb']
-
-import geopandas as gpd
-from shapely.geometry import Point, shape
-import numpy as np
-import folium
-from streamlit_folium import st_folium
-from folium.plugins import Draw
-import altair as alt
-from PIL import Image
 
 
 @st.cache_data
@@ -106,6 +114,11 @@ def load_data():
             
             # Enforce types again just in case
             df['dataset'] = df['dataset'].astype(str)
+            
+            # ERA5 OFFSET FIX: Add 1B to ERA5 IDs to prevent collision with CHIRPS
+            if 'pixel_id' in df.columns and 'dataset' in df.columns:
+                df.loc[df['dataset'] == 'era5', 'pixel_id'] += 1000000000
+                
             return df
         except Exception:
             # Silently fail and fallback to CSV
@@ -128,6 +141,10 @@ def load_data():
                 df['dataset'] = df['dataset'].astype(str)
             else:
                 df['dataset'] = 'chirps' # Default fallback
+            
+            # ERA5 OFFSET FIX: Add 1B to ERA5 IDs to prevent collision with CHIRPS
+            if 'pixel_id' in df.columns and 'dataset' in df.columns:
+                df.loc[df['dataset'] == 'era5', 'pixel_id'] += 1000000000
             
             # --- Load and Merge Mapping Data ---
             if os.path.exists(MAPPING_PATH) and os.path.exists(CLUSTERS_PATH):
@@ -216,7 +233,11 @@ def load_era5_pixels():
     """Load ERA5 pixel coordinates."""
     if os.path.exists(ERA5_PATH):
         try:
-            return pd.read_csv(ERA5_PATH)
+            df = pd.read_csv(ERA5_PATH)
+            # ERA5 OFFSET FIX: Match the offset in load_data
+            if 'pixel_id' in df.columns:
+                df['pixel_id'] += 1000000000
+            return df
         except Exception as e:
             st.error(f"Erro ao carregar ERA5: {e}")
             return pd.DataFrame()
@@ -246,7 +267,14 @@ def filter_pixels_spatially(df, gdf, lat_col='latitude', lon_col='longitude'):
 
 
 def main():
-    st.title("Perdas Históricas por Pixel (Rio Grande do Sul)")
+    # Header with Logo in Top-Right
+    col_header1, col_header2 = st.columns([0.8, 0.2])
+    with col_header1:
+        st.title("Perdas Históricas por Pixel (Rio Grande do Sul)")
+    with col_header2:
+        logo_path = os.path.join(BASE_DIR, "logo.png")
+        if os.path.exists(logo_path):
+            st.image(Image.open(logo_path), use_column_width=True)
     
     # Load Data
     df = load_data()
@@ -255,6 +283,18 @@ def main():
     
     # Load Shapes for Spatial Filtering
     gdf, _ = load_shapefiles()
+
+    # --- Instruções de Uso ---
+    with st.expander("📖 Guia de Uso - Primeiro Acesso", expanded=False):
+        st.markdown("""
+        Bem-vindo ao Dashboard de Perdas Climáticas. Aqui estão algumas orientações para sua análise:
+        
+        1.  **Filtros Laterais**: Utilize a barra lateral para filtrar os dados por **Intervalo de Anos**, **Município** ou **Cluster**.
+        2.  **Melhores Práticas**: Recomendamos selecionar **apenas Municípios OU apenas Clusters** para evitar conflitos de seleção, embora o sistema suporte ambos.
+        3.  **Seleção Múltipla**: Você pode selecionar vários itens em cada filtro.
+        4.  **Mapa Interativo**: Use as ferramentas de desenho no mapa (polígono, retângulo, círculo) para selecionar áreas específicas.
+        5.  **Análise de Seleção**: Os gráficos e métricas na parte inferior serão atualizados automaticamente com base na sua escolha (via filtros ou mapa).
+        """)
 
     # Ensure dataset is string to avoid Arrow errors
     if 'dataset' in df.columns:
@@ -290,7 +330,48 @@ def main():
          # Rename columns to match df for filtering convenience
          df_era5.rename(columns={'NM_MUN': 'muni_name'}, inplace=True)
     
+    # --- Portfolio Statistics (Fixed / Static) ---
+    st.markdown("### Estatísticas de Toda a Região (Portfólio)")
+    st.markdown("Estas estatísticas representam todo o portfólio (todos os pixels) para o período de tempo completo (1996-2025).")
+    
+    # Calculate Annual Losses with Reindexing to include 0-loss years
+    full_years = pd.Index(range(1996, 2026), name='year')
+    
+    portfolio_annual = df_portfolio.groupby('year')['payout'].sum()
+    portfolio_annual = portfolio_annual.reindex(full_years, fill_value=0.0)
+    
+    port_total_loss = portfolio_annual.sum()
+    port_mean_loss = portfolio_annual.mean()
+    port_max_loss = portfolio_annual.max()
+    
+    # Calculate Counts
+    chirps_pixels = df_portfolio[df_portfolio['dataset'] == 'chirps']['pixel_id'].nunique()
+    era5_pixels = df_portfolio[df_portfolio['dataset'] == 'era5']['pixel_id'].nunique()
+    muni_count = df_portfolio['muni_name'].nunique()
+    
+    # Calculate Active Years per Peril
+    chirps_active_years = df_portfolio[(df_portfolio['dataset'] == 'chirps') & (df_portfolio['payout'] > 0)]['year'].nunique()
+    era5_active_years = df_portfolio[(df_portfolio['dataset'] == 'era5') & (df_portfolio['payout'] > 0)]['year'].nunique()
+    
+    # Display Top Metrics
+    # Use delta for "Active Years" or color
+    col_stat1, col_stat2, col_stat3, col_stat4, col_stat5, col_stat6 = st.columns(6)
+    
+    col_stat1.metric("Cumulative Historical Loss", f"${port_total_loss:,.0f}")
+    col_stat2.metric("Average Annual Loss", f"${port_mean_loss:,.0f}")
+    col_stat3.metric("Max Annual Loss", f"${port_max_loss:,.0f}")
+    col_stat4.metric("Municipalities", f"{muni_count}")
+    
+    # Show Pixels and Years (Hardcoded 30 years for Portfolio)
+    col_stat5.metric("CHIRPS (Rainfall)", f"{chirps_pixels:,} px", f"{chirps_active_years}/30 years active")
+    col_stat6.metric("ERA5 (Soil Moisture)", f"{era5_pixels:,} px", f"{era5_active_years}/30 years active")
+
+    st.markdown("---")
+
     # Sidebar Filters
+    logo_path = os.path.join(BASE_DIR, "logo.png")
+    if os.path.exists(logo_path):
+        st.sidebar.image(Image.open(logo_path), use_column_width=True)
     st.sidebar.header("Filtros")
     
     # Year Slider
@@ -338,11 +419,7 @@ def main():
         st.warning("Nenhum dado encontrado com os filtros selecionados.")
         return
 
-    # Process Button
-    if st.sidebar.button("Processar Filtros"):
-        process_clicked = True
-    else:
-        process_clicked = False
+    # Process Button Removed - Auto-update implemented below
 
     # 1. Map Visualization
     st.subheader("Perda Total Histórica por Pixel")
@@ -353,7 +430,7 @@ def main():
     map_data.rename(columns={'payout': 'total_loss'}, inplace=True)
     
     # Create GeoDataFrame for spatial operations
-    gdf = gpd.GeoDataFrame(
+    pixels_map_gdf = gpd.GeoDataFrame(
         map_data,
         geometry=gpd.points_from_xy(map_data.longitude, map_data.latitude),
         crs="EPSG:4326"
@@ -361,6 +438,8 @@ def main():
     
     # Create Map
     m = folium.Map(location=[-30.0, -53.0], zoom_start=7, tiles="CartoDB positron")
+
+
     
     # Add Draw Control
     draw = Draw(
@@ -372,29 +451,32 @@ def main():
     draw.add_to(m)
     
     # Add Heatmap/Circles
+    # Add Heatmap/Circles
     for _, row in map_data.iterrows():
-        # Color based on loss magnitude
-        color = "#e5f5e0" # Light green (low loss)
+        # Color based on loss magnitude (Increased intensity)
+        # Using brighter colors and higher opacity
+        color = "#c7e9c0" # Pale green
         if row['total_loss'] > 50000:
-            color = "#a1d99b"
+            color = "#74c476"
         if row['total_loss'] > 100000:
-            color = "#31a354"
+            color = "#238b45"
         if row['total_loss'] > 200000:
-            color = "#006d2c" # Dark green (high loss)
+            color = "#00441b" # Darkest green
             
         folium.CircleMarker(
             location=[row['latitude'], row['longitude']],
-            radius=3,
-            color=color,
+            radius=4, # Slightly larger
+            color="#333333", # Dark stroke for contrast
+            weight=1,
             fill=True,
             fill_color=color,
-            fill_opacity=0.7,
-            popup=f"Pixel {int(row['pixel_id'])}: ${row['total_loss']:,.2f}",
+            fill_opacity=0.9, # More opaque/intense
+            popup=f"Pixel {int(row['pixel_id'])}: ${row['total_loss']:,.0f}",
             tooltip=f"Pixel {int(row['pixel_id'])}"
         ).add_to(m)
 
     # Render Map and Capture Interaction
-    output = st_folium(m, width=None, height=500)
+    output = st_folium(m, width=None, height=800)
     
     # --- State Management & Selection Logic ---
     
@@ -405,6 +487,12 @@ def main():
         st.session_state['last_map_output'] = None
     if 'selection_source' not in st.session_state:
         st.session_state['selection_source'] = 'default'
+        
+    # Track filter state for auto-updates
+    if 'last_selected_munis' not in st.session_state:
+        st.session_state['last_selected_munis'] = []
+    if 'last_selected_clusters' not in st.session_state:
+        st.session_state['last_selected_clusters'] = []
 
     # Check for Map Changes
     # specific keys to watch for changes
@@ -419,20 +507,51 @@ def main():
     # Update cache
     st.session_state['last_map_output'] = current_map_state
     
+    # Check for Filter Changes
+    filter_changed = False
+    if selected_munis != st.session_state['last_selected_munis']:
+        filter_changed = True
+        st.session_state['last_selected_munis'] = selected_munis
+    
+    if selected_clusters != st.session_state['last_selected_clusters']:
+        filter_changed = True
+        st.session_state['last_selected_clusters'] = selected_clusters
+    
     selected_pixel_ids = []
 
     # Priority Logic:
-    # 1. Button Click (Overrides everything)
-    # 2. Map Interaction (Overrides previous state)
+    # 1. Filter Change (Auto-update via Sidebar)
+    # 2. Map Interaction (Overrides previous state if new action)
     # 3. Existing Session State (Persists previous choice)
     # 4. Default (First pixel)
 
-    if process_clicked:
-        # User explicitly requested to process the filtered pixels
-        selected_pixel_ids = df_filtered['pixel_id'].unique().tolist()
+    if filter_changed:
+        # User changed filters, update selection immediately
+        chirps_ids = df_filtered['pixel_id'].unique().tolist()
+        
+        # Also grab valid ERA5 pixels for these filters
+        # because df (CHIRPS) might lack muni mapping for ERA5, so filtering df drops them.
+        # df_era5 has dynamically joined muni names.
+        era5_ids = []
+        if not df_era5.empty:
+            subset_era5 = df_era5.copy()
+            # Apply same filters
+            if selected_munis:
+                subset_era5 = subset_era5[subset_era5['muni_name'].isin(selected_munis)]
+            if selected_clusters:
+                subset_era5 = subset_era5[subset_era5['cluster'].isin(selected_clusters)]
+            
+            # Ensure we only pick pixels that assume exist in the main loss df for consistency,
+            # Or just take all valid ERA5 pixels?
+            # If main df has no ERA5 data for id=X, then adding X to selected_pixel_ids keeps it empty in pixel_df (metrics) anyway.
+            # So it is safe to add.
+            if 'pixel_id' in subset_era5.columns:
+                era5_ids = subset_era5['pixel_id'].unique().tolist()
+
+        selected_pixel_ids = list(set(chirps_ids + era5_ids))
         st.session_state['selected_pixel_ids'] = selected_pixel_ids
-        st.session_state['selection_source'] = 'filter_button'
-        st.success(f"Filtro Processado: {len(selected_pixel_ids)} pixels selecionados.")
+        st.session_state['selection_source'] = 'filter_change'
+        # st.success(f"Filtros Atualizados: {len(selected_pixel_ids)} pixels.")
         
     elif map_interaction_occurred and (output.get('last_active_drawing') or output.get('last_object_clicked')):
         # User interacted with map
@@ -447,7 +566,7 @@ def main():
                 # Polygon or Rectangle
                 draw_shape = shape(drawing['geometry'])
                 # Spatial filter using GeoPandas
-                selected_gdf = gdf[gdf.geometry.within(draw_shape)]
+                selected_gdf = pixels_map_gdf[pixels_map_gdf.geometry.within(draw_shape)]
                 selected_pixel_ids = selected_gdf['pixel_id'].tolist()
                 
             elif geom_type == 'Point' and 'properties' in drawing and 'radius' in drawing['properties']:
@@ -462,8 +581,8 @@ def main():
                 # Convert to radians
                 lat1 = np.radians(center_lat)
                 lon1 = np.radians(center_lon)
-                lat2 = np.radians(gdf['latitude'])
-                lon2 = np.radians(gdf['longitude'])
+                lat2 = np.radians(pixels_map_gdf['latitude'])
+                lon2 = np.radians(pixels_map_gdf['longitude'])
                 
                 dlat = lat2 - lat1
                 dlon = lon2 - lon1
@@ -472,7 +591,7 @@ def main():
                 c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1-a))
                 distances = R * c
                 
-                selected_gdf = gdf[distances <= radius_m]
+                selected_gdf = pixels_map_gdf[distances <= radius_m]
                 selected_pixel_ids = selected_gdf['pixel_id'].tolist()
                 
             if selected_pixel_ids:
@@ -500,7 +619,7 @@ def main():
         if st.session_state['selected_pixel_ids']:
              selected_pixel_ids = st.session_state['selected_pixel_ids']
              curr_source = st.session_state['selection_source']
-             if curr_source == 'filter_button':
+             if curr_source == 'filter_change' or curr_source == 'filter_button':
                  st.info(f"Visualizando seleção via Filtro: {len(selected_pixel_ids)} pixels.")
              elif curr_source == 'map_interaction':
                  st.info(f"Visualizando seleção via Mapa: {len(selected_pixel_ids)} pixels.")
@@ -508,65 +627,92 @@ def main():
              # Default: First pixel if nothing selected ever
              if not df.empty:
                 selected_pixel_ids = [sorted(df['pixel_id'].unique())[0]]
-                st.info("Selecione um pixel, desenhe no mapa, ou use 'Processar Filtros'.")
+                st.info("Selecione um pixel, desenhe no mapa, ou use os filtros laterais.")
 
     # --- Context Maps (Clusters & Municipalities) ---
     st.markdown("---")
-    st.subheader("Mapas de Contexto dos Clusters")
+    st.subheader("Referência de Clusters")
+    st.info("Nota: Este mapa é apenas para referência. Utilize os filtros na barra lateral ou o mapa interativo acima para selecionar regiões para análise.")
     
-    # Use pre-rendered cluster analysis plots
-    # These are relative to the CWD (filled_data), not BASE_DIR (web_app)
-    # UPDATED: Use local copies in 'data' folder for reliability
-    chirps_map_path = os.path.join(BASE_DIR, "data", "map_chirps.png")
-    era5_map_path = os.path.join(BASE_DIR, "data", "map_era5.png")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        if os.path.exists(chirps_map_path):
-            st.image(Image.open(chirps_map_path), caption="Rainfall Pixels (CHIRPS) by Cluster", use_column_width=True)
-        else:
-             st.warning(f"Mapa não encontrado: {chirps_map_path}")
-             
-    with col2:
-        if os.path.exists(era5_map_path):
-            st.image(Image.open(era5_map_path), caption="Soil Moisture Pixels (ERA5) by Cluster", use_column_width=True)
-        else:
-             st.warning(f"Mapa não encontrado: {era5_map_path}")
+    if gdf is not None:
+         # Define specific colors to match the palette
+         # Colors: 0-9
+         colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
+         
+         # Create a small folium map for reference
+         m_ref = folium.Map(location=[-30.0, -53.0], zoom_start=6, tiles="CartoDB positron", zoom_control=False, scrollWheelZoom=False, dragging=False)
+         
+         # Add Municipalities colored by Cluster
+         folium.GeoJson(
+             gdf,
+             style_function=lambda x: {
+                 'fillColor': colors[x['properties']['cluster'] % len(colors)] if x['properties']['cluster'] != -1 else '#cccccc',
+                 'color': 'black',
+                 'weight': 0.5,
+                 'fillOpacity': 0.7
+             },
+             tooltip=folium.GeoJsonTooltip(
+                 fields=['NM_MUN', 'cluster'],
+                 aliases=['Município:', 'Cluster:'],
+                 localize=True
+             )
+         ).add_to(m_ref)
+
+         # Add Cluster Number Labels
+         clusters_gdf = gdf.dissolve(by='cluster').centroid
+         for cluster_id, centroid in clusters_gdf.items():
+             if cluster_id != -1:
+                 folium.Marker(
+                     location=[centroid.y, centroid.x],
+                     icon=folium.DivIcon(
+                         html=f'<div style="font-size: 12pt; font-weight: bold; color: white; text-shadow: -1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000, 1px 1px 0 #000;">{int(cluster_id)}</div>',
+                         icon_anchor=(5,5)
+                     )
+                 ).add_to(m_ref)
+         
+         st_folium(m_ref, width=None, height=500, key="ref_map") # width=None fills container
+    else:
+         st.info("Shapefile não carregado.")
 
     if not selected_pixel_ids:
         st.stop()
 
-    # Calculate Pixel Counts for Selection
-    # CHIRPS: filtered by current selection
-    n_chirps = df_filtered['pixel_id'].nunique()
-    
-    # ERA5: filtered by current selection (Muni/Cluster)
-    # If selected_pixel_ids came from MAP CLICK, we can't easily filter ERA5 unless it's spatial.
-    # But usually filters apply.
-    era5_subset = df_era5.copy()
-    if selected_munis:
-        era5_subset = era5_subset[era5_subset['muni_name'].isin(selected_munis)]
-    if selected_clusters:
-        era5_subset = era5_subset[era5_subset['cluster'].isin(selected_clusters)]
-    
-    n_era5 = len(era5_subset)
-    
-    # Calculate Totals for comparison (unfiltered by spatial)
-    total_chirps = df_portfolio[df_portfolio['dataset']=='chirps']['pixel_id'].nunique()
-    total_era5 = df_portfolio[df_portfolio['dataset']=='era5']['pixel_id'].nunique()
-    
-    st.info(f"Pixels na Seleção (Filtro Espacial): **{n_chirps}** / {total_chirps} CHIRPS | **{n_era5}** / {total_era5} ERA5")
-
-    # 3. Process Selected Data
+    # Selection breakdown by peril
     pixel_df = df[df['pixel_id'].isin(selected_pixel_ids)].copy()
     
-    # Apply Time Filter to the detailed view as well
+    # Apply Time Filter to the detailed view
     pixel_df = pixel_df[
         (pixel_df['year'] >= selected_years[0]) & 
         (pixel_df['year'] <= selected_years[1])
     ]
     
+    # Calculate unique IDs per dataset for the selection
+    sel_chirps_px = pixel_df[pixel_df['dataset']=='chirps']['pixel_id'].nunique()
+    sel_era5_px = pixel_df[pixel_df['dataset']=='era5']['pixel_id'].nunique()
+    
+    # Calculate active years per peril (Selection)
+    sel_chirps_years = pixel_df[(pixel_df['dataset']=='chirps') & (pixel_df['payout']>0)]['year'].nunique()
+    sel_era5_years = pixel_df[(pixel_df['dataset']=='era5') & (pixel_df['payout']>0)]['year'].nunique()
+    
+    all_years = range(selected_years[0], selected_years[1] + 1)
+    n_years_sel = len(all_years)
+    
+    # Calculate Totals for comparison (unfiltered by spatial)
+    total_chirps = df_portfolio[df_portfolio['dataset']=='chirps']['pixel_id'].nunique()
+    total_era5 = df_portfolio[df_portfolio['dataset']=='era5']['pixel_id'].nunique()
+    
+    
+    # Construct Description of Selection
+    sel_desc_parts = []
+    if selected_munis:
+        sel_desc_parts.append(f"Municípios: {', '.join(selected_munis)}")
+    if selected_clusters:
+        sel_desc_parts.append(f"Clusters: {sorted(selected_clusters)}")
+    
+    selection_description = " | ".join(sel_desc_parts) if sel_desc_parts else "Seleção Personalizada/Manual"
+    
+    st.info(f"**{selection_description}** — Pixels: **{sel_chirps_px}** / {total_chirps} CHIRPS | **{sel_era5_px}** / {total_era5} ERA5")
+
     # Prepare data for charting (Aggregation vs Single)
     # Ensure aggregation is correct
     if len(selected_pixel_ids) > 1:
@@ -578,18 +724,11 @@ def main():
         # Summing 'triggered' boolean (True=1) gives count of triggers
         trigger_counts = pixel_df.groupby(['year', 'window'])['triggered'].sum().reset_index()
         chart_df = chart_df.merge(trigger_counts, on=['year', 'window'])
-        
-        # analysys_title = f"Análise Regional ({len(selected_pixel_ids)} pixels)"
-        pass
-        
     else:
         # SINGLE PIXEL
         chart_df = pixel_df.copy()
-        # analysys_title = f"Análise do Pixel {int(selected_pixel_ids[0])}"
-        pass
 
     # Ensure full timeline (Selected Years only)
-    all_years = range(selected_years[0], selected_years[1] + 1)
     full_index = pd.MultiIndex.from_product([all_years, WINDOWS], names=['year', 'window'])
     
     if not chart_df.empty:
@@ -602,147 +741,143 @@ def main():
 
     # Calculate metrics based on Chart DF
     total_payout = chart_df['payout'].sum()
-    # Max annual payout
     max_year_payout = chart_df.groupby('year')['payout'].sum().max()
-    # Total trigger events
-    total_triggers = chart_df['triggered'].sum()
-    if len(selected_pixel_ids) == 1:
-         # For single pixel, triggered might be boolean in original df, but sum works same (True=1)
-         pass
+    avg_annual_payout = total_payout / len(all_years) if len(all_years) > 0 else 0
 
     # Display Metrics
-    # Display Metrics
-    st.subheader("Análise da Área Selecionada")
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Indenização Total Histórica", f"${total_payout:,.2f}")
-    col2.metric("Máxima Indenização Anual", f"${max_year_payout:,.2f}")
-    col3.metric("Eventos de Acionamento", f"{int(total_triggers)}")
+    st.subheader("Selection Analysis")
+    col1, col2, col3, col4, col5 = st.columns(5)
+    
+    col1.metric("Cumulative Historical Loss", f"${total_payout:,.0f}")
+    col2.metric("Average Annual Loss", f"${avg_annual_payout:,.0f}")
+    col3.metric("Max Annual Loss", f"${max_year_payout:,.0f}")
+    col4.metric("CHIRPS (Rainfall)", f"{sel_chirps_px:,} px", f"{sel_chirps_years}/{n_years_sel} years active")
+    col5.metric("ERA5 (Soil Moisture)", f"{sel_era5_px:,} px", f"{sel_era5_years}/{n_years_sel} years active")
 
     # 4. Charts
     st.markdown("---")
-    st.subheader("Análise da Área Selecionada")
         
     st.markdown("#### Histórico de Perdas por Ano e Janela")
     
+    # Map Windows to Full Names
+    window_map = {
+        'apr_may': 'April-May (Rainfall)',
+        'sep_oct': 'September-October (Soil Moisture)',
+        'oct_dec': 'October-December (Soil Moisture)',
+        'dec_feb': 'December-February (Rainfall)'
+    }
+    
+    # Apply mapping
+    chart_df['window_label'] = chart_df['window'].map(window_map).fillna(chart_df['window'])
+    
+    # Define Colors
+    domain = ['April-May (Rainfall)', 'September-October (Soil Moisture)', 'October-December (Soil Moisture)', 'December-February (Rainfall)']
+    range_ = ['#1f77b4', '#d8b365', '#a6611a', '#17becf'] # Blue (Apr-May), Browns (Sep-Dec), Cyan/Blue (Dec-Feb)
+
     chart_title = "Perda Regional Agregada" if len(selected_pixel_ids) > 1 else "Perda do Pixel"
     
     chart = alt.Chart(chart_df).mark_bar().encode(
-        x=alt.X('year:O', title='Ano'),
-        y=alt.Y('payout:Q', title='Indenização ($)'),
-        color=alt.Color('window:N', title='Janela'),
-        tooltip=['year', 'window', alt.Tooltip('payout', format='$,.2f', title='Indenização'), alt.Tooltip('triggered', title='Acionamentos')]
+        x=alt.X('year:O', title='Year'),
+        y=alt.Y('payout:Q', title='Payout ($)'),
+        color=alt.Color('window_label:N', scale=alt.Scale(domain=domain, range=range_), title='Window'),
+        tooltip=['year', 'window_label', alt.Tooltip('payout', format='$,.0f', title='Payout'), alt.Tooltip('triggered', title='Triggers')]
     ).properties(height=400, title=chart_title)
     
     st.altair_chart(chart, use_container_width=True)
     
-    # 5. Events Table
-    if len(selected_pixel_ids) == 1:
-        st.subheader("Eventos de Acionamento")
-        # Filter from original pixel_df
-        triggers = pixel_df[pixel_df['triggered'] == True].sort_values('year', ascending=False)
-        if not triggers.empty:
-            st.dataframe(
-                triggers[['year', 'window', 'raw_percentile', 'coverage_mult', 'payout']].style.format({
-                    'raw_percentile': '{:.1f}',
-                    'payout': '${:,.2f}',
-                    'coverage_mult': '{:.0%}'
-                }),
-                column_config={
-                    "year": "Ano",
-                    "window": "Janela",
-                    "raw_percentile": "Percentil",
-                    "coverage_mult": "Cobertura",
-                    "payout": "Indenização"
-                }
-            )
-        else:
-            st.info("Nenhum evento de acionamento para este pixel.")
-    else:
-        st.subheader("Eventos Regionais Agregados")
-        # Show aggregated stats per year/window (from chart_df)
-        # Filter for rows with activity
-        regional_events = chart_df[chart_df['payout'] > 0].sort_values(['year', 'payout'], ascending=[False, False])
-        
-        if not regional_events.empty:
-            st.dataframe(
-                regional_events[['year', 'window', 'payout', 'triggered']].style.format({
-                    'year': '{:.0f}',
-                    'payout': '${:,.2f}',
-                    'triggered': '{:.0f}'
-                }),
-                column_config={
-                    "year": "Ano",
-                    "window": "Janela",
-                    "payout": "Indenização Total",
-                    "triggered": "Total de Acionamentos"
-                }
-            )
-        else:
-            st.info("Nenhuma perda nesta região.")
+            
+    # --- Download Selection Data ---
+    st.markdown("---")
+    st.subheader("Exportar Dados da Seleção")
+    st.warning("⚠️ **Aviso**: Os resultados obtidos através deste dashboard são preliminares e indicativos. Para fins de precificação final, propostas comerciais ou propósitos legais, os dados devem ser expressamente confirmados pela Suyana.")
+    
+    # Prepare download dataframe
+    download_df = pixel_df.copy()
+    
+    # Attempt to enrich ERA5 metadata if 'muni_name' is missing/unknown for them in main df
+    # (Since main df mapping might not cover ERA5 pixels)
+    if not df_era5.empty:
+        # subset df_era5 to relevant pixels to save memory/time
+        relevant_era5_ids = download_df[download_df['dataset'] == 'era5']['pixel_id'].unique()
+        if len(relevant_era5_ids) > 0:
+            # FIX: De-duplicate meta info (pixel_id) to prevent row expansion if a pixel touches multiple border areas
+            era5_subset_info = df_era5[df_era5['pixel_id'].isin(relevant_era5_ids)][['pixel_id', 'muni_name', 'cluster']].drop_duplicates(subset='pixel_id')
+            
+            # Merge
+            download_df = download_df.merge(era5_subset_info, on='pixel_id', how='left', suffixes=('', '_era5'))
+            
+            # Fill missing/Desconhecido values
+            # Assuming 'Desconhecido' or NaN in main df
+            mask_fill = (download_df['dataset'] == 'era5')
+            if 'muni_name_era5' in download_df.columns:
+                download_df.loc[mask_fill, 'muni_name'] = download_df.loc[mask_fill, 'muni_name_era5'].fillna(download_df.loc[mask_fill, 'muni_name'])
+            if 'cluster_era5' in download_df.columns:
+                 download_df.loc[mask_fill, 'cluster'] = download_df.loc[mask_fill, 'cluster_era5'].fillna(download_df.loc[mask_fill, 'cluster'])
+            
+            # Cleanup
+            drop_cols = [c for c in download_df.columns if '_era5' in c]
+            download_df.drop(columns=drop_cols, inplace=True)
+            
+    # Add 'Perigo' Column (Portuguese Mapping)
+    download_df['peril'] = download_df['dataset'].map({'chirps': 'Chuva', 'era5': 'Seca'}).fillna('Desconhecido')
 
-    # --- Portfolio Statistics (Fixed / Static) ---
-    st.markdown("### Estatísticas de Toda a Região (Portfólio)")
-    st.markdown("Estas estatísticas representam todo o portfólio (todos os pixels) para o período de tempo completo (1996-2025).")
+    # Select and Rename Columns
+    cols_to_export = {
+        'year': 'Ano',
+        'window': 'Janela',
+        'peril': 'Perigo',
+        'dataset': 'Fonte de Dados',
+        'muni_name': 'Município',
+        'cluster': 'Cluster',
+        'pixel_id': 'Pixel ID',
+        'payout': 'Perda ($)',
+        'triggered': 'Acionamento (Sim/Não)'
+    }
     
-    # We use 'df_portfolio' (the original loaded dataframe, cleaned of negative IDs but NOT spatially filtered) 
-    # ensuring it represents the full 28M/40-20 structure.
+    # Filter only existing columns
+    existing_cols = [c for c in cols_to_export.keys() if c in download_df.columns]
+    download_df = download_df[existing_cols].rename(columns=cols_to_export)
     
-    # Calculate Annual Losses with Reindexing to include 0-loss years
-    # HARDCODED: The 28M/40-20 structure is strictly 30 years (1996-2025).
-    # Dynamic min/max might miss years with 0 loss (e.g. 1996), skewing the mean.
-    full_years = pd.Index(range(1996, 2026), name='year')
-    
-    portfolio_annual = df_portfolio.groupby('year')['payout'].sum()
-    portfolio_annual = portfolio_annual.reindex(full_years, fill_value=0.0)
-    
-    port_total_loss = portfolio_annual.sum()
-    port_mean_loss = portfolio_annual.mean()
-    port_max_loss = portfolio_annual.max()
-    port_p95_loss = portfolio_annual.quantile(0.95)
-    port_p99_loss = portfolio_annual.quantile(0.99)
-    
-    col_stat1, col_stat2, col_stat3, col_stat4, col_stat5 = st.columns(5)
-    col_stat1.metric("Perda Total do Portfólio", f"${port_total_loss:,.2f}")
-    col_stat2.metric("Perda Média Anual", f"${port_mean_loss:,.2f}")
-    col_stat3.metric("Perda Máxima Anual", f"${port_max_loss:,.2f}")
-    col_stat4.metric("Perda P95 Anual", f"${port_p95_loss:,.2f}")
-    col_stat5.metric("Perda P99 Anual", f"${port_p99_loss:,.2f}")
-    
-    st.markdown("#### Detalhamento por Perigo (Peril)")
-    # Breakdown by Dataset (CHIRPS vs ERA5)
-    # Use df_portfolio for consistency
-    # 1. Pixel Counts
-    chirps_pixels = df_portfolio[df_portfolio['dataset'] == 'chirps']['pixel_id'].nunique()
-    era5_pixels = df_portfolio[df_portfolio['dataset'] == 'era5']['pixel_id'].nunique()
-    
-    # 2. Total Losses
-    chirps_loss = df_portfolio[df_portfolio['dataset'] == 'chirps']['payout'].sum()
-    era5_loss = df_portfolio[df_portfolio['dataset'] == 'era5']['payout'].sum()
-    
-    # 3. Events (Triggered)
-    if 'triggered' in df_portfolio.columns:
-        chirps_events = df_portfolio[(df_portfolio['dataset'] == 'chirps') & (df_portfolio['triggered'] == True)].shape[0]
-        era5_events = df_portfolio[(df_portfolio['dataset'] == 'era5') & (df_portfolio['triggered'] == True)].shape[0]
-    else:
-         chirps_events = df_portfolio[(df_portfolio['dataset'] == 'chirps') & (df_portfolio['payout'] > 0)].shape[0]
-         era5_events = df_portfolio[(df_portfolio['dataset'] == 'era5') & (df_portfolio['payout'] > 0)].shape[0]
+    # Sort
+    if 'Ano' in download_df.columns and 'Janela' in download_df.columns:
+        download_df.sort_values(by=['Ano', 'Janela'], inplace=True)
 
-    bd_col1, bd_col2, bd_col3 = st.columns(3)
+    # Convert to XLSX with Multiple Sheets
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+        # Sheet 1: Raw Data
+        download_df.to_excel(writer, index=False, sheet_name='Dados Brutos')
+        
+        # Sheet 2: Yearly Aggregate
+        agg_annual = download_df.groupby('Ano')['Perda ($)'].sum().reset_index()
+        agg_annual.to_excel(writer, index=False, sheet_name='Agregado Anual')
+        
+        # Sheet 3: Year-Peril Aggregate
+        agg_peril = download_df.groupby(['Ano', 'Perigo', 'Fonte de Dados'])['Perda ($)'].sum().reset_index()
+        agg_peril.to_excel(writer, index=False, sheet_name='Agregado Ano-Perigo')
+        
+        # Sheet 4: Year-Cluster-Peril Aggregate
+        if 'Cluster' in download_df.columns:
+            agg_cluster = download_df.groupby(['Ano', 'Cluster', 'Perigo', 'Fonte de Dados'])['Perda ($)'].sum().reset_index()
+            agg_cluster.to_excel(writer, index=False, sheet_name='Agregado Ano-Cluster-Perigo')
+            
+        # Sheet 5: Year-Municipality-Peril Aggregate
+        if 'Município' in download_df.columns:
+            agg_muni = download_df.groupby(['Ano', 'Município', 'Perigo', 'Fonte de Dados'])['Perda ($)'].sum().reset_index()
+            agg_muni.to_excel(writer, index=False, sheet_name='Agregado Ano-Mun-Perigo')
+            
+    excel_data = buffer.getvalue()
     
-    with bd_col1:
-        st.markdown("**Contagem de Pixels**")
-        st.write(f"CHIRPS (Chuva): **{chirps_pixels}**")
-        st.write(f"ERA5 (Umidade): **{era5_pixels}**")
-        
-    with bd_col2:
-        st.markdown("**Perda Total ($)**")
-        st.write(f"CHIRPS: **${chirps_loss:,.2f}**")
-        st.write(f"ERA5: **${era5_loss:,.2f}**")
-        
-    with bd_col3:
-        st.markdown("**Eventos de Acionamento**")
-        st.write(f"CHIRPS: **{chirps_events}**")
-        st.write(f"ERA5: **{era5_events}**")
+    st.download_button(
+        label="📥 Baixar Dados da Seleção (Excel Multi-Abas)",
+        data=excel_data,
+        file_name='perdas_selecao_pixel_clima_completo.xlsx',
+        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    )
+    
+
+
+
 
 if __name__ == "__main__":
     main()
