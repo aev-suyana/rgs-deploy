@@ -715,11 +715,17 @@ def main():
     # Selection breakdown by peril
     pixel_df = df[df['pixel_id'].isin(selected_pixel_ids)].copy()
     
-    # Apply Time Filter to the detailed view
+    # Apply Filters to the selection
     pixel_df = pixel_df[
         (pixel_df['year'] >= selected_years[0]) & 
         (pixel_df['year'] <= selected_years[1])
     ]
+    
+    if selected_perils:
+        pixel_df = pixel_df[pixel_df['dataset'].isin(selected_perils)]
+        
+    if selected_windows:
+        pixel_df = pixel_df[pixel_df['window'].isin(selected_windows)]
     
     # Calculate unique IDs per dataset for the selection
     sel_chirps_px = pixel_df[pixel_df['dataset']=='chirps']['pixel_id'].nunique()
@@ -745,6 +751,12 @@ def main():
         # Cast to standard int to avoid np.int64 display in banner
         clean_clusters = [int(c) for c in selected_clusters]
         sel_desc_parts.append(f"Clusters: {sorted(clean_clusters)}")
+        
+    if selected_perils_friendly:
+        sel_desc_parts.append(f"Perigos: {', '.join(selected_perils_friendly)}")
+        
+    if selected_windows_friendly:
+        sel_desc_parts.append(f"Janelas: {', '.join(selected_windows_friendly)}")
     
     selection_description = " | ".join(sel_desc_parts) if sel_desc_parts else "Seleção Personalizada/Manual"
     
