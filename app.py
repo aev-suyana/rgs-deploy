@@ -243,6 +243,32 @@ def load_era5_pixels():
             return pd.DataFrame()
     return pd.DataFrame()
 
+@st.cache_data
+def get_spatially_joined_data(df, df_era5, _gdf):
+    """Refined cached function to handle expensive spatial joins."""
+    # Filter CHIRPS (df)
+    df_chirps = filter_pixels_spatially(df, _gdf) if not df.empty and _gdf is not None else df
+    
+    # Filter and Enrich ERA5
+    df_era5_filtered = pd.DataFrame()
+    if not df_era5.empty and _gdf is not None:
+        era5_gdf = gpd.GeoDataFrame(
+            df_era5,
+            geometry=gpd.points_from_xy(df_era5.longitude, df_era5.latitude),
+            crs="EPSG:4326"
+        )
+        era5_joined = gpd.sjoin(era5_gdf, _gdf[['geometry', 'NM_MUN', 'cluster', 'muni_norm']], how='inner', predicate='intersects')
+        df_era5_filtered = pd.DataFrame(era5_joined.drop(columns='geometry'))
+        df_era5_filtered.rename(columns={'NM_MUN': 'muni_name'}, inplace=True)
+        
+    # Ensure dataset is string to avoid Arrow serialization errors
+    if 'dataset' in df_chirps.columns:
+        df_chirps['dataset'] = df_chirps['dataset'].astype(str)
+    if 'dataset' in df_era5_filtered.columns:
+        df_era5_filtered['dataset'] = df_era5_filtered['dataset'].astype(str)
+        
+    return df_chirps, df_era5_filtered
+
 def filter_pixels_spatially(df, gdf, lat_col='latitude', lon_col='longitude'):
     """Strictly filter pixels to be within the municipality polygons."""
     if df.empty or gdf.empty:
@@ -305,30 +331,27 @@ def main():
     if not df.empty:
         df = df[df['pixel_id'] >= 0]
 
+    # Load and Filter ERA5 (Cached Join)
+    df_era5_raw = load_era5_pixels()
+    df, df_era5 = get_spatially_joined_data(df, df_era5_raw, gdf)
+    
+    # Update Mapping info in the main dataframe for ERA5 pixels
+    # Since load_data() only has muni mapping for CHIRPS, we must transfer
+    # the spatial join findings to the time-series dataframe.
+    if not df_era5.empty:
+        # Create lookup maps
+        era5_muni_map = df_era5[['pixel_id', 'muni_name']].drop_duplicates().set_index('pixel_id')['muni_name'].to_dict()
+        era5_cluster_map = df_era5[['pixel_id', 'cluster']].drop_duplicates().set_index('pixel_id')['cluster'].to_dict()
+        
+        # Apply to df
+        is_era5 = df['dataset'] == 'era5'
+        df.loc[is_era5, 'muni_name'] = df.loc[is_era5, 'pixel_id'].map(era5_muni_map).fillna(df.loc[is_era5, 'muni_name'])
+        df.loc[is_era5, 'cluster'] = df.loc[is_era5, 'pixel_id'].map(era5_cluster_map).fillna(df.loc[is_era5, 'cluster'])
+        
     # Create a copy for Portfolio Stats (Static / Full Payout Structure)
     # This preserves pixels that might be spatially "stray" (outside shapefile) 
     # but are valid for the financial portfolio calculations.
     df_portfolio = df.copy()
-
-    # Strict Spatial Filter to remove "Stray Pixels" for Visuals/Interaction
-    # Filter CHIRPS (df)
-    if not df.empty and gdf is not None:
-         df = filter_pixels_spatially(df, gdf)
-    
-    # Load and Filter ERA5
-    df_era5 = load_era5_pixels()
-    if not df_era5.empty and gdf is not None:
-         # Enrich ERA5 with Muni/Cluster info via Spatial Join
-         # (We need muni/cluster to filter them for stats)
-         era5_gdf = gpd.GeoDataFrame(
-            df_era5,
-            geometry=gpd.points_from_xy(df_era5.longitude, df_era5.latitude),
-            crs="EPSG:4326"
-         )
-         era5_joined = gpd.sjoin(era5_gdf, gdf[['geometry', 'NM_MUN', 'cluster', 'muni_norm']], how='inner', predicate='intersects')
-         df_era5 = pd.DataFrame(era5_joined.drop(columns='geometry'))
-         # Rename columns to match df for filtering convenience
-         df_era5.rename(columns={'NM_MUN': 'muni_name'}, inplace=True)
     
     # --- Portfolio Statistics (Fixed / Static) ---
     st.markdown("### Estatísticas de Toda a Região (Portfólio)")
@@ -403,15 +426,20 @@ def main():
     )
     
     # Peril Filter
-    peril_options = ["Chuva (CHIRPS)", "Seca (ERA5)"]
+    peril_options = ["Chuva (Rainfall)", "Seca (Soil Moisture)"]
     selected_perils_friendly = st.sidebar.multiselect(
         "Filtrar por Perigo",
         options=peril_options,
         default=[]
     )
-    # Map back to dataset values
-    peril_map_rev = {"Chuva (CHIRPS)": "chirps", "Seca (ERA5)": "era5"}
-    selected_perils = [peril_map_rev[p] for p in selected_perils_friendly]
+    # Map Perils to specific Windows
+    peril_window_map = {
+        "Chuva (Rainfall)": ['apr_may', 'dec_feb'],
+        "Seca (Soil Moisture)": ['sep_oct', 'oct_dec']
+    }
+    selected_peril_windows = []
+    for p in selected_perils_friendly:
+        selected_peril_windows.extend(peril_window_map[p])
     
     # Window Filter
     # Map Windows to Full Names (same as in charts for consistency)
@@ -443,8 +471,8 @@ def main():
     if selected_clusters:
         df_filtered = df_filtered[df_filtered['cluster'].isin(selected_clusters)]
         
-    if selected_perils:
-        df_filtered = df_filtered[df_filtered['dataset'].isin(selected_perils)]
+    if selected_peril_windows:
+        df_filtered = df_filtered[df_filtered['window'].isin(selected_peril_windows)]
         
     if selected_windows:
         df_filtered = df_filtered[df_filtered['window'].isin(selected_windows)]
@@ -485,30 +513,32 @@ def main():
     )
     draw.add_to(m)
     
-    # Add Heatmap/Circles
-    # Add Heatmap/Circles
+    # Add Markers (Optimized using FastMarkerCluster for performance)
+    from folium.plugins import FastMarkerCluster
+    
+    callback = """
+        function (row) {
+            var icon = L.divIcon({
+                className: 'custom-div-icon',
+                html: "<div style='background-color:" + row[4] + "; width:8px; height:8px; border-radius:50%; border:1px solid #333;'></div>",
+                iconSize: [8, 8]
+            });
+            var marker = L.marker(new L.LatLng(row[0], row[1]), {icon: icon});
+            marker.bindPopup("Pixel " + row[3] + ": $" + row[2].toLocaleString());
+            return marker;
+        };
+    """
+    
+    # Data: [lat, lon, loss, id, color]
+    marker_data = []
     for _, row in map_data.iterrows():
-        # Color based on loss magnitude (Increased intensity)
-        # Using brighter colors and higher opacity
-        color = "#c7e9c0" # Pale green
-        if row['total_loss'] > 50000:
-            color = "#74c476"
-        if row['total_loss'] > 100000:
-            color = "#238b45"
-        if row['total_loss'] > 200000:
-            color = "#00441b" # Darkest green
-            
-        folium.CircleMarker(
-            location=[row['latitude'], row['longitude']],
-            radius=4, # Slightly larger
-            color="#333333", # Dark stroke for contrast
-            weight=1,
-            fill=True,
-            fill_color=color,
-            fill_opacity=0.9, # More opaque/intense
-            popup=f"Pixel {int(row['pixel_id'])}: ${row['total_loss']:,.0f}",
-            tooltip=f"Pixel {int(row['pixel_id'])}"
-        ).add_to(m)
+        color = "#c7e9c0"
+        if row['total_loss'] > 50000: color = "#74c476"
+        if row['total_loss'] > 100000: color = "#238b45"
+        if row['total_loss'] > 200000: color = "#00441b"
+        marker_data.append([row['latitude'], row['longitude'], row['total_loss'], int(row['pixel_id']), color])
+    
+    FastMarkerCluster(marker_data, callback=callback).add_to(m)
 
     # Render Map and Capture Interaction
     output = st_folium(m, width=None, height=800)
@@ -556,9 +586,9 @@ def main():
         filter_changed = True
         st.session_state['last_selected_clusters'] = selected_clusters
         
-    if selected_perils != st.session_state['last_selected_perils']:
+    if selected_perils_friendly != st.session_state['last_selected_perils']:
         filter_changed = True
-        st.session_state['last_selected_perils'] = selected_perils
+        st.session_state['last_selected_perils'] = selected_perils_friendly
         
     if selected_windows != st.session_state['last_selected_windows']:
         filter_changed = True
@@ -733,8 +763,8 @@ def main():
         (pixel_df['year'] <= selected_years[1])
     ]
     
-    if selected_perils:
-        pixel_df = pixel_df[pixel_df['dataset'].isin(selected_perils)]
+    if selected_peril_windows:
+        pixel_df = pixel_df[pixel_df['window'].isin(selected_peril_windows)]
         
     if selected_windows:
         pixel_df = pixel_df[pixel_df['window'].isin(selected_windows)]
@@ -789,8 +819,12 @@ def main():
         # SINGLE PIXEL
         chart_df = pixel_df.copy()
 
-    # Ensure full timeline (Selected Years only)
-    full_index = pd.MultiIndex.from_product([all_years, WINDOWS], names=['year', 'window'])
+    # Ensure full timeline (Selected Years and Windows only)
+    active_windows = selected_peril_windows if selected_peril_windows else WINDOWS
+    if selected_windows:
+        active_windows = [w for w in active_windows if w in selected_windows]
+        
+    full_index = pd.MultiIndex.from_product([all_years, active_windows], names=['year', 'window'])
     
     if not chart_df.empty:
         chart_df = chart_df.set_index(['year', 'window'])
