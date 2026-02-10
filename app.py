@@ -73,9 +73,9 @@ def load_shapefiles():
             cluster_df['muni_norm'] = cluster_df['muni_name_first'].str.lower().str.strip()
             
             # Merge
-            # Use 'cluster_aligned' which corresponds to the MD guide (2=South, 4=West)
-            gdf = gdf.merge(cluster_df[['muni_norm', 'cluster_aligned']], on='muni_norm', how='left')
-            gdf.rename(columns={'cluster_aligned': 'cluster'}, inplace=True)
+            # Use 'cluster_aligned' which corresponds to the MD guide
+            gdf = gdf.merge(cluster_df[['muni_norm', 'cluster_aligned', 'centroid_lat', 'centroid_lon']], on='muni_norm', how='left')
+            gdf.rename(columns={'cluster_aligned': 'cluster', 'centroid_lat': 'muni_lat', 'centroid_lon': 'muni_lon'}, inplace=True)
             gdf['cluster'] = gdf['cluster'].fillna(-1).astype(int)
         else:
             gdf['cluster'] = -1
@@ -146,71 +146,65 @@ def load_data():
             if 'pixel_id' in df.columns and 'dataset' in df.columns:
                 df.loc[df['dataset'] == 'era5', 'pixel_id'] += 1000000000
             
-            # --- Load and Merge Mapping Data ---
-            if os.path.exists(MAPPING_PATH) and os.path.exists(CLUSTERS_PATH):
+            # --- Source-of-Truth Spatial Mapping ---
+            # Instead of relying on an external mapping file that may be out of sync,
+            # we derive the municipality and cluster names directly from the coordinates
+            # embedded in the main data file.
+            
+            if os.path.exists(CLUSTERS_PATH):
                 try:
-                    # 1. Pixel -> Muni
-                    loss_df = df
-                    muni_map = pd.read_csv(MAPPING_PATH)
+                    # 1. Load Shapefile and Cluster Info for Spatial Join
+                    gdf, _ = load_shapefiles()
+                    if gdf is None:
+                        raise Exception("Failed to load shapefiles for spatial join.")
                     
-                    # Force pixel_id to int to match loss_df (handle potential NaNs/floats)
-                    muni_map['pixel_id'] = pd.to_numeric(muni_map['pixel_id'], errors='coerce').fillna(-1).astype(int)
+                    # 2. Extract Unique Coordinates from Climate Data
+                    # We need a clean list of physical locations (pixel_id + lat + lon)
+                    # to perform the spatial join once.
+                    # CRITICAL: Drop duplicates by pixel_id to prevent row explosion if 
+                    # the source file consistently reused IDs for different coords (found in debug).
+                    unique_coords = df[['pixel_id', 'latitude', 'longitude']].drop_duplicates(subset=['pixel_id'])
                     
-                    # Keep lat/lon for map plotting
-                    muni_map = muni_map[['pixel_id', 'muni_name', 'muni_id', 'latitude', 'longitude']]
+                    # Ensure lat/lon are numeric
+                    unique_coords['latitude'] = pd.to_numeric(unique_coords['latitude'])
+                    unique_coords['longitude'] = pd.to_numeric(unique_coords['longitude'])
                     
-                    # 2. Muni -> Cluster
-                    cluster_map = pd.read_csv(CLUSTERS_PATH)
-                    cluster_map = cluster_map[['muni_name_first', 'cluster_aligned', 'centroid_lon', 'centroid_lat']]
-                    cluster_map.rename(columns={
-                        'muni_name_first': 'muni_name', 
-                        'cluster_aligned': 'cluster',
-                        'centroid_lon': 'muni_lon',
-                        'centroid_lat': 'muni_lat'
-                    }, inplace=True)
+                    # Create GDF for spatial join
+                    pixels_gdf = gpd.GeoDataFrame(
+                        unique_coords,
+                        geometry=gpd.points_from_xy(unique_coords.longitude, unique_coords.latitude),
+                        crs="EPSG:4326"
+                    )
                     
-                    # 3. Merge
-                    # Merge pixel map first
-                    # If loss_df already has lat/lon, merge will suffix them.
-                    # We prefer the lat/lon from MAPPING_PATH (muni_map) as it is verified 'clean'?
-                    # Or valid_pixels_era5 has lat/lon?
-                    # The error shows latitude_x and latitude_y.
-                    # latitude_x comes from loss_df. latitude_y comes from muni_map.
-                    # We'll use Coalesce or just Rename.
+                    # 3. Perform Spatial Join
+                    # Join with municipality geometry and cluster info
+                    # Note: load_shapefiles already merged cluster info into the GDF.
+                    joined_gdf = gpd.sjoin(pixels_gdf, gdf[['geometry', 'NM_MUN', 'cluster', 'muni_lat', 'muni_lon']], how='left', predicate='intersects')
                     
-                    df_merged = pd.merge(loss_df, muni_map, on='pixel_id', how='left')
+                    # Rename columns for consistency
+                    spatial_map = pd.DataFrame(joined_gdf.drop(columns='geometry'))
+                    spatial_map.rename(columns={'NM_MUN': 'muni_name'}, inplace=True)
                     
-                    # Resolve suffixes if present
-                    if 'latitude_y' in df_merged.columns:
-                        df_merged['latitude'] = df_merged['latitude_y'].fillna(df_merged['latitude_x'])
-                        df_merged['longitude'] = df_merged['longitude_y'].fillna(df_merged['longitude_x'])
-                        df_merged.drop(columns=['latitude_x', 'longitude_x', 'latitude_y', 'longitude_y'], inplace=True, errors='ignore')
-                    
-                    # Merge cluster info
-                    df_merged = pd.merge(df_merged, cluster_map, on='muni_name', how='left')
+                    # CRITICAL: Drop duplicates if a pixel overlaps multiple muni boundaries
+                    # sjoin can return multiple rows for boundary pixels. We just take the first match.
+                    spatial_map = spatial_map.drop_duplicates(subset=['pixel_id'])
                     
                     # Fill NaNs for display
-                    df_merged['muni_name'] = df_merged['muni_name'].fillna('Desconhecido')
-                    df_merged['cluster'] = df_merged['cluster'].fillna(-1).astype(int)
+                    spatial_map['muni_name'] = spatial_map['muni_name'].fillna('Desconhecido')
+                    spatial_map['cluster'] = spatial_map['cluster'].fillna(-1).astype(int)
                     
-                    # Filter out summary/sentinel rows (pixel_id < 0) to fix portfolio stats
-                    # The user file has pixel_id = -1 for global aggregates
-                    # MOVED TO MAIN for clarity and correct df_portfolio creation
-                    # df_merged = df_merged[df_merged['pixel_id'] >= 0]
+            # 4. Merge Accurate Mapping back to Time-Series Data
+                    # We drop the old inconsistent columns from df if they exist
+                    cols_to_drop = ['muni_name', 'cluster', 'muni_lat', 'muni_lon']
+                    df = df.drop(columns=[c for c in cols_to_drop if c in df.columns])
                     
-                    df = df_merged
+                    df = pd.merge(df, spatial_map[['pixel_id', 'muni_name', 'cluster', 'muni_lat', 'muni_lon']], on='pixel_id', how='left')
                     
                 except Exception as e:
-                    st.error(f"Erro CRÍTICO ao carregar arquivos de mapeamento: {e}")
-                    st.error(f"Verifique se {MAPPING_PATH} e {CLUSTERS_PATH} estão corretos e legíveis.")
-                    st.stop() # Stop execution to prevent cascading errors
+                    st.error(f"Erro ao gerar mapeamento espacial: {e}")
+                    st.stop()
             else:
-                 st.error(f"Arquivos de mapeamento não encontrados: {MAPPING_PATH} ou {CLUSTERS_PATH}")
-                 st.stop()
-                 
-            # Final Validation
-            if 'latitude' not in df.columns or 'longitude' not in df.columns:
-                 st.error(f"Erro: Colunas de Latitude/Longitude não foram mescladas corretamente. Colunas atuais: {df.columns.tolist()}")
+                 st.error(f"Arquivo de clusters não encontrado: {CLUSTERS_PATH}")
                  st.stop()
 
             # Save as Parquet for future speedups
@@ -331,6 +325,11 @@ def main():
     if not df.empty:
         df = df[df['pixel_id'] >= 0]
 
+    # Create a copy for Portfolio Stats (Static / Full Payout Structure)
+    # This preserves pixels that might be spatially "stray" (outside shapefile) 
+    # but are valid for the financial portfolio calculations.
+    df_portfolio = df.copy()
+
     # Load and Filter ERA5 (Cached Join)
     df_era5_raw = load_era5_pixels()
     df, df_era5 = get_spatially_joined_data(df, df_era5_raw, gdf)
@@ -348,11 +347,6 @@ def main():
         df.loc[is_era5, 'muni_name'] = df.loc[is_era5, 'pixel_id'].map(era5_muni_map).fillna(df.loc[is_era5, 'muni_name'])
         df.loc[is_era5, 'cluster'] = df.loc[is_era5, 'pixel_id'].map(era5_cluster_map).fillna(df.loc[is_era5, 'cluster'])
         
-    # Create a copy for Portfolio Stats (Static / Full Payout Structure)
-    # This preserves pixels that might be spatially "stray" (outside shapefile) 
-    # but are valid for the financial portfolio calculations.
-    df_portfolio = df.copy()
-    
     # --- Portfolio Statistics (Fixed / Static) ---
     st.markdown("### Estatísticas de Toda a Região (Portfólio)")
     st.markdown("Estas estatísticas representam todo o portfólio (todos os pixels) para o período de tempo completo (1996-2025).")
@@ -398,7 +392,7 @@ def main():
     st.sidebar.header("Filtros")
     
     # Year Slider
-    min_year = int(df['year'].min())
+    min_year = 1996 # Hardcoded to include 0-loss start year
     max_year = int(df['year'].max())
     selected_years = st.sidebar.slider(
         "Selecione o Intervalo de Anos",
@@ -434,8 +428,8 @@ def main():
     )
     # Map Perils to specific Windows
     peril_window_map = {
-        "Chuva (Rainfall)": ['apr_may', 'dec_feb'],
-        "Seca (Soil Moisture)": ['sep_oct', 'oct_dec']
+        "Chuva (Rainfall)": ['apr_may', 'sep_oct'],
+        "Seca (Soil Moisture)": ['oct_dec', 'dec_feb']
     }
     selected_peril_windows = []
     for p in selected_perils_friendly:
@@ -445,9 +439,9 @@ def main():
     # Map Windows to Full Names (same as in charts for consistency)
     window_map_display = {
         'apr_may': 'April-May (Rainfall)',
-        'sep_oct': 'September-October (Soil Moisture)',
+        'sep_oct': 'September-October (Rainfall)',
         'oct_dec': 'October-December (Soil Moisture)',
-        'dec_feb': 'December-February (Rainfall)'
+        'dec_feb': 'December-February (Soil Moisture)'
     }
     available_windows_friendly = list(window_map_display.values())
     selected_windows_friendly = st.sidebar.multiselect(
@@ -701,10 +695,10 @@ def main():
              elif curr_source == 'map_interaction':
                  st.info(f"Visualizando seleção via Mapa: {len(selected_pixel_ids)} pixels.")
         else:
-             # Default: First pixel if nothing selected ever
+             # Default: All pixels if nothing selected ever
              if not df.empty:
-                selected_pixel_ids = [sorted(df['pixel_id'].unique())[0]]
-                st.info("Selecione um pixel, desenhe no mapa, ou use os filtros laterais.")
+                selected_pixel_ids = df['pixel_id'].unique().tolist()
+                st.info("Visualizando todo o portfólio por padrão. Utilize filtros ou mapa para refinar.")
 
     # --- Context Maps (Clusters & Municipalities) ---
     st.markdown("---")
@@ -857,17 +851,17 @@ def main():
     # Map Windows to Full Names
     window_map = {
         'apr_may': 'April-May (Rainfall)',
-        'sep_oct': 'September-October (Soil Moisture)',
+        'sep_oct': 'September-October (Rainfall)',
         'oct_dec': 'October-December (Soil Moisture)',
-        'dec_feb': 'December-February (Rainfall)'
+        'dec_feb': 'December-February (Soil Moisture)'
     }
     
     # Apply mapping
     chart_df['window_label'] = chart_df['window'].map(window_map).fillna(chart_df['window'])
     
     # Define Colors
-    domain = ['April-May (Rainfall)', 'September-October (Soil Moisture)', 'October-December (Soil Moisture)', 'December-February (Rainfall)']
-    range_ = ['#1f77b4', '#d8b365', '#a6611a', '#17becf'] # Blue (Apr-May), Browns (Sep-Dec), Cyan/Blue (Dec-Feb)
+    domain = ['April-May (Rainfall)', 'September-October (Rainfall)', 'October-December (Soil Moisture)', 'December-February (Soil Moisture)']
+    range_ = ['#1f77b4', '#17becf', '#a6611a', '#d8b365'] # Blue, Cyan (Rain); Brown, Tan (Soil)
 
     chart_title = "Perda Regional Agregada" if len(selected_pixel_ids) > 1 else "Perda do Pixel"
     
@@ -875,6 +869,7 @@ def main():
         x=alt.X('year:O', title='Year'),
         y=alt.Y('payout:Q', title='Payout ($)'),
         color=alt.Color('window_label:N', scale=alt.Scale(domain=domain, range=range_), title='Window'),
+        order=alt.Order('window_label:N', sort='ascending'), # Force consistent stacking order
         tooltip=['year', 'window_label', alt.Tooltip('payout', format='$,.0f', title='Payout'), alt.Tooltip('triggered', title='Triggers')]
     ).properties(height=400, title=chart_title)
     
