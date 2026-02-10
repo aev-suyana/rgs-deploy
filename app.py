@@ -800,8 +800,16 @@ def main():
         # subset df_era5 to relevant pixels to save memory/time
         relevant_era5_ids = download_df[download_df['dataset'] == 'era5']['pixel_id'].unique()
         if len(relevant_era5_ids) > 0:
-            # FIX: De-duplicate meta info (pixel_id) to prevent row expansion if a pixel touches multiple border areas
-            era5_subset_info = df_era5[df_era5['pixel_id'].isin(relevant_era5_ids)][['pixel_id', 'muni_name', 'cluster']].drop_duplicates(subset='pixel_id')
+            # FIX: Filter metadata by active sidebar selections to avoid bringing in "odd" regions.
+            # Then de-duplicate to ensure one-to-one mapping for the export.
+            era_meta = df_era5[df_era5['pixel_id'].isin(relevant_era5_ids)][['pixel_id', 'muni_name', 'cluster']]
+            
+            if selected_munis:
+                era_meta = era_meta[era_meta['muni_name'].isin(selected_munis)]
+            elif selected_clusters:
+                era_meta = era_meta[era_meta['cluster'].isin(selected_clusters)]
+            
+            era5_subset_info = era_meta.drop_duplicates(subset='pixel_id')
             
             # Merge
             download_df = download_df.merge(era5_subset_info, on='pixel_id', how='left', suffixes=('', '_era5'))
