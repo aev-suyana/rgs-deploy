@@ -528,6 +528,10 @@ def main():
         st.session_state['last_selected_munis'] = []
     if 'last_selected_clusters' not in st.session_state:
         st.session_state['last_selected_clusters'] = []
+    if 'last_selected_perils' not in st.session_state:
+        st.session_state['last_selected_perils'] = []
+    if 'last_selected_windows' not in st.session_state:
+        st.session_state['last_selected_windows'] = []
 
     # Check for Map Changes
     # specific keys to watch for changes
@@ -551,6 +555,14 @@ def main():
     if selected_clusters != st.session_state['last_selected_clusters']:
         filter_changed = True
         st.session_state['last_selected_clusters'] = selected_clusters
+        
+    if selected_perils != st.session_state['last_selected_perils']:
+        filter_changed = True
+        st.session_state['last_selected_perils'] = selected_perils
+        
+    if selected_windows != st.session_state['last_selected_windows']:
+        filter_changed = True
+        st.session_state['last_selected_windows'] = selected_windows
     
     selected_pixel_ids = []
 
